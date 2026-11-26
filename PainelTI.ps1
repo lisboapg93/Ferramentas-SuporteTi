@@ -194,6 +194,72 @@ function Saude-Disco {
     Escrever-Log 'Consultou a saúde do disco'
 }
 
+# Cria um ponto de restauração e confere se o Windows o registrou de fato.
+# O Windows ignora (só com um aviso, sem erro) um segundo ponto em menos de 24 h; por isso
+# esse limite é zerado durante a criação e volta ao valor anterior logo em seguida.
+function Novo-PontoRestauracao([string]$descricao) {
+    $chave = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+    $nomeValor = 'SystemRestorePointCreationFrequency'
+    $anterior = (Get-ItemProperty -Path $chave -Name $nomeValor -ErrorAction SilentlyContinue).$nomeValor
+    $ultimo = [int](Get-ComputerRestorePoint -ErrorAction SilentlyContinue | Measure-Object SequenceNumber -Maximum).Maximum
+    try {
+        New-ItemProperty -Path $chave -Name $nomeValor -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        Checkpoint-Computer -Description $descricao -RestorePointType MODIFY_SETTINGS -ErrorAction Stop -WarningAction SilentlyContinue
+    } finally {
+        if ($null -eq $anterior) { Remove-ItemProperty -Path $chave -Name $nomeValor -ErrorAction SilentlyContinue }
+        else { New-ItemProperty -Path $chave -Name $nomeValor -Value $anterior -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null }
+    }
+    $novo = Get-ComputerRestorePoint -ErrorAction SilentlyContinue | Where-Object { $_.SequenceNumber -gt $ultimo } | Select-Object -Last 1
+    if (-not $novo) { throw 'o Windows não registrou o ponto (a Proteção do Sistema pode estar desligada no disco do Windows).' }
+    return $novo
+}
+
+function Criar-PontoRestauracao {
+    Titulo 'Criar ponto de restauração'
+    Write-Host 'Guarda o estado atual do Windows (configurações, drivers, programas e registro).'
+    Write-Host 'Arquivos pessoais (documentos, fotos) não entram no ponto de restauração.'
+    $padrao = 'Painel TI - manual {0:dd/MM/yyyy HH:mm}' -f (Get-Date)
+    $descricao = "$(Read-Host "Descrição (Enter para '$padrao')")".Trim()
+    if (-not $descricao) { $descricao = $padrao }
+
+    Iniciar-Etapas 1
+    Etapa 'Criando o ponto de restauração (pode levar 1 minuto)...'
+    $ponto = $null
+    try { $ponto = Novo-PontoRestauracao $descricao }
+    catch {
+        $motivo = $_.Exception.Message
+        Erro "Ponto de restauração não criado: $motivo"
+        if (-not (Confirmar "Ligar a Proteção do Sistema no $env:SystemDrive e tentar de novo?")) {
+            Escrever-Log "Ponto de restauração: falhou ($motivo)"
+            return
+        }
+        Iniciar-Etapas 2
+        Etapa "Ligando a Proteção do Sistema no $env:SystemDrive..."
+        try { Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop }
+        catch {
+            Erro "Não consegui ligar a Proteção do Sistema: $($_.Exception.Message)"
+            Escrever-Log "Ponto de restauração: falhou ao ligar a Proteção do Sistema ($($_.Exception.Message))"
+            return
+        }
+        Etapa 'Criando o ponto de restauração...'
+        try { $ponto = Novo-PontoRestauracao $descricao }
+        catch {
+            Erro "Ponto de restauração não criado: $($_.Exception.Message)"
+            Escrever-Log "Ponto de restauração: falhou ($($_.Exception.Message))"
+            return
+        }
+        Ok "Proteção do Sistema ligada no $env:SystemDrive."
+    }
+
+    Ok ('Ponto de restauração criado: {0} (nº {1}).' -f $ponto.Description, $ponto.SequenceNumber)
+    Write-Host 'Para voltar a ele: Executar > rstrui.exe (Restauração do Sistema).'
+    Write-Host ''
+    Write-Host 'Últimos pontos de restauração neste PC:'
+    Get-ComputerRestorePoint -ErrorAction SilentlyContinue | Select-Object -Last 5 |
+        Format-Table @{n = 'Nº'; e = { $_.SequenceNumber } }, @{n = 'Data'; e = { $_.ConvertToDateTime($_.CreationTime) } }, Description -AutoSize | Out-Host
+    Escrever-Log "Ponto de restauração criado: $($ponto.Description)"
+}
+
 # Primeiro executável de uma linha de comando do registro (ex.: '"C:\x\a.exe" /min' -> 'C:\x\a.exe').
 function Executavel-DoComando([string]$comando) {
     $cmd = [Environment]::ExpandEnvironmentVariables($comando).Trim()
@@ -278,7 +344,7 @@ function Corrigir-Registro {
     Iniciar-Etapas (1 + $chaves.Count + $achados.Count)
     Etapa 'Criando ponto de restauração (pode levar 1 minuto)...'
     try {
-        Checkpoint-Computer -Description 'Painel TI - antes de corrigir o registro' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+        Novo-PontoRestauracao 'Painel TI - antes de corrigir o registro' | Out-Null
         Ok 'Ponto de restauração criado.'
     } catch { Aviso "Ponto de restauração não criado ($($_.Exception.Message)). Seguindo só com o backup .reg." }
 
@@ -839,10 +905,11 @@ $opcoes = [ordered]@{
     '24' = @('Ver registro de ações deste PC', ${function:Ver-Log})
     '25' = @('Corrigir registro do Windows (entradas quebradas)', ${function:Corrigir-Registro})
     '26' = @('Desligar/ligar Defender e Firewall', ${function:Defender-Firewall})
+    '27' = @('Criar ponto de restauração', ${function:Criar-PontoRestauracao})
 }
 
 $grupos = [ordered]@{
-    'MANUTENÇÃO DO SISTEMA' = '1', '2', '3', '4', '5', '6', '25'
+    'MANUTENÇÃO DO SISTEMA' = '1', '2', '3', '4', '5', '6', '25', '27'
     'REDE E INTERNET'       = '7', '8', '9', '10', '11'
     'IMPRESSÃO'             = '12', '13'
     'DIAGNÓSTICO'           = '14', '15', '16'
